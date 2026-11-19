@@ -121,14 +121,26 @@ The database is created on first run at `%AppData%\ExpenseLog\expenses.db`.
 | `MalformedFileIsReportedInsteadOfThrowing` | A wrong file produces a message, not an exception |
 | `MigrationsCreateAWorkingSchema` | The checked-in migration actually applies |
 
+## Operational behaviour
+
+- **Queries, imports and exports run off the UI thread**, serialised behind a gate because
+  `DbContext` is not thread-safe. A slow query no longer freezes the window.
+- **Stale responses are discarded.** Each filter change increments a generation counter; a late
+  result from an older filter is dropped instead of overwriting the grid.
+- **One instance only.** A named mutex stops a second copy, which would otherwise fight the first
+  over the same SQLite file and surface "database is locked".
+- **Delete is undoable** from the toolbar, and undo re-inserts the row with a new id.
+- **Failures are logged** to `%AppData%\ExpenseLog\crash.log` and shown once, so the window never
+  closes silently.
+
 ## What I'd do next
 
 - Charts for monthly spend by category (`System.Windows.Forms.DataVisualization`)
 - Budgets per category with over-budget highlighting
-- Undo for delete, which currently only asks for confirmation
 - Multi-currency with a stored exchange rate per row
 - MSIX packaging and code signing so installs don't trip SmartScreen
-- Bulk edit and a proper `DataGridView` error provider for inline validation
+- Bulk edit and inline validation via `DataGridView` error providers
+- Undo history longer than one step
 
 ## License
 

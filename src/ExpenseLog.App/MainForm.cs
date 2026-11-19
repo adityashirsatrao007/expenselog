@@ -1,12 +1,13 @@
-using System.Globalization;
+using System.IO;
 using ExpenseLog.Data;
 using Microsoft.EntityFrameworkCore;
 
 namespace ExpenseLog.App;
 
 /// <summary>
-/// One long-lived window with one long-lived DbContext. For a single-user desktop app that
-/// is simpler than a unit-of-work per action, and SQLite handles the concurrency fine.
+/// One window with one long-lived DbContext. Queries and CSV work run on the thread pool
+/// behind a gate, because <see cref="ExpenseLogContext"/> is not thread-safe and a slow
+/// query used to freeze the window.
 /// </summary>
 public sealed class MainForm : Form
 {
@@ -14,15 +15,23 @@ public sealed class MainForm : Form
 
     private readonly ExpenseLogContext _context;
     private readonly ExpenseService _service;
+    private readonly SemaphoreSlim _databaseGate = new(1, 1);
 
     private readonly DateTimePicker _fromPicker = new() { Format = DateTimePickerFormat.Short, Width = 108 };
     private readonly DateTimePicker _toPicker = new() { Format = DateTimePickerFormat.Short, Width = 108 };
     private readonly ComboBox _categoryFilter = new() { Width = 160, DropDownStyle = ComboBoxStyle.DropDownList };
     private readonly TextBox _searchBox = new() { Width = 190, PlaceholderText = "Search note or category" };
     private readonly DataGridView _grid = new();
+    private readonly ToolStripButton _undoButton = new("Undo delete")
+    {
+        DisplayStyle = ToolStripItemDisplayStyle.Text,
+    };
+
     private readonly ToolStripStatusLabel _countLabel = new();
     private readonly ToolStripStatusLabel _totalLabel = new() { Spring = true, TextAlign = ContentAlignment.MiddleRight };
 
+    private (DateOnly Date, decimal Amount, string Category, string Note)? _lastDeleted;
+    private int _filterGeneration;
     private bool _ready;
 
     public MainForm()
@@ -37,18 +46,19 @@ public sealed class MainForm : Form
         _service = new ExpenseService(_context);
 
         BuildUi();
+        _undoButton.Enabled = false;
     }
 
     public string DatabasePath { get; }
 
-    protected override void OnLoad(EventArgs e)
+    protected override async void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
 
         try
         {
             // Migrate, not EnsureCreated, so existing databases gain new columns over time.
-            _context.Database.Migrate();
+            await Task.Run(() => _context.Database.Migrate());
         }
         catch (Exception ex)
         {
@@ -69,13 +79,16 @@ public sealed class MainForm : Form
 
         LoadCategories();
         _ready = true;
-        ApplyFilters();
+        await ApplyFiltersAsync();
     }
 
     protected override void Dispose(bool disposing)
     {
         if (disposing)
+        {
             _context.Dispose();
+            _databaseGate.Dispose();
+        }
 
         base.Dispose(disposing);
     }
@@ -83,7 +96,7 @@ public sealed class MainForm : Form
     private void BuildUi()
     {
         Text = "ExpenseLog";
-        MinimumSize = new Size(780, 480);
+        MinimumSize = new Size(820, 480);
         Size = new Size(1060, 640);
         StartPosition = FormStartPosition.CenterScreen;
 
@@ -91,9 +104,12 @@ public sealed class MainForm : Form
         toolbar.Items.Add(Button("Add", AddExpense));
         toolbar.Items.Add(Button("Edit", EditSelected));
         toolbar.Items.Add(Button("Delete", DeleteSelected));
+        toolbar.Items.Add(_undoButton);
         toolbar.Items.Add(new ToolStripSeparator());
-        toolbar.Items.Add(Button("Import CSV…", ImportCsv));
-        toolbar.Items.Add(Button("Export CSV…", ExportCsv));
+        toolbar.Items.Add(Button("Import CSV…", () => _ = ImportCsvAsync()));
+        toolbar.Items.Add(Button("Export CSV…", () => _ = ExportCsvAsync()));
+
+        _undoButton.Click += (_, _) => UndoDelete();
 
         var filters = new FlowLayoutPanel
         {
@@ -114,16 +130,16 @@ public sealed class MainForm : Form
         status.Items.Add(_countLabel);
         status.Items.Add(_totalLabel);
 
-        _fromPicker.ValueChanged += (_, _) => ApplyFilters();
-        _toPicker.ValueChanged += (_, _) => ApplyFilters();
-        _categoryFilter.SelectedIndexChanged += (_, _) => ApplyFilters();
-        _searchBox.KeyDown += (_, args) =>
+        _fromPicker.ValueChanged += async (_, _) => await ApplyFiltersAsync();
+        _toPicker.ValueChanged += async (_, _) => await ApplyFiltersAsync();
+        _categoryFilter.SelectedIndexChanged += async (_, _) => await ApplyFiltersAsync();
+        _searchBox.KeyDown += async (_, args) =>
         {
             if (args.KeyCode != Keys.Enter)
                 return;
 
             args.SuppressKeyPress = true;
-            ApplyFilters();
+            await ApplyFiltersAsync();
         };
 
         // Fill is added first so the docked bars claim their space before the grid fills the rest.
@@ -159,21 +175,63 @@ public sealed class MainForm : Form
         _grid.Columns.Add(Column("Note", nameof(ExpenseRow.Note), 50));
     }
 
-    private void ApplyFilters()
+    /// <summary>
+    /// Runs the query off the UI thread and discards the result if a newer filter was applied
+    /// while it was running — the classic stale-response race on a filtered grid.
+    /// </summary>
+    private async Task ApplyFiltersAsync()
     {
         if (!_ready)
             return;
 
+        var generation = ++_filterGeneration;
         var (from, to) = SelectedRange();
         var category = _categoryFilter.SelectedItem as string;
         if (category == AllCategories)
             category = null;
 
-        var expenses = _service.Query(from, to, category, _searchBox.Text);
+        var text = _searchBox.Text;
+
+        List<Expense> expenses = [];
+        List<CategoryTotal> totals = [];
+
+        try
+        {
+            await _databaseGate.WaitAsync();
+            try
+            {
+                (expenses, totals) = await Task.Run(() =>
+                {
+                    var rows = _service.Query(from, to, category, text).ToList();
+                    var grouped = _service.TotalsByCategory(from, to).ToList();
+                    return (rows, grouped);
+                });
+            }
+            finally
+            {
+                _databaseGate.Release();
+            }
+        }
+        catch (Exception ex)
+        {
+            ErrorLog.Write(ex, "query");
+            _countLabel.Text = "Query failed";
+            MessageBox.Show(this, ex.Message, "Could not load expenses", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
+        if (generation != _filterGeneration)
+            return;
 
         _grid.DataSource = expenses.Select(ExpenseRow.From).ToList();
         _countLabel.Text = $"{expenses.Count} expense(s)";
-        _totalLabel.Text = $"Total: {expenses.Sum(expense => expense.Amount):N2}";
+
+        var total = expenses.Sum(expense => expense.Amount);
+        var summary = totals.Count == 0
+            ? $"Total: {total:N2}"
+            : $"Total: {total:N2}   ·   {totals[0].Category}: {totals[0].Total:N2} of {totals.Count} categories";
+
+        _totalLabel.Text = summary;
     }
 
     private void LoadCategories()
@@ -200,7 +258,7 @@ public sealed class MainForm : Form
 
         _service.Add(dialog.ExpenseDate, dialog.Amount, dialog.Category, dialog.Note);
         LoadCategories();
-        ApplyFilters();
+        _ = ApplyFiltersAsync();
     }
 
     private void EditSelected()
@@ -212,7 +270,7 @@ public sealed class MainForm : Form
         if (expense is null)
         {
             // Deleted underneath us; refresh rather than failing.
-            ApplyFilters();
+            _ = ApplyFiltersAsync();
             return;
         }
 
@@ -223,7 +281,7 @@ public sealed class MainForm : Form
 
         _service.Update(expense, dialog.ExpenseDate, dialog.Amount, dialog.Category, dialog.Note);
         LoadCategories();
-        ApplyFilters();
+        _ = ApplyFiltersAsync();
     }
 
     private void DeleteSelected()
@@ -231,9 +289,16 @@ public sealed class MainForm : Form
         if (SelectedRow() is not { } row)
             return;
 
+        var expense = _context.Expenses.Find(row.Id);
+        if (expense is null)
+        {
+            _ = ApplyFiltersAsync();
+            return;
+        }
+
         var confirmed = MessageBox.Show(
             this,
-            $"Delete \"{row.Note}\" ({row.Amount}) on {row.Date}?",
+            $"Delete \"{row.Note}\" ({row.Amount}) on {row.Date}?\n\nYou can undo this from the toolbar.",
             "Delete expense",
             MessageBoxButtons.OKCancel,
             MessageBoxIcon.Warning);
@@ -241,12 +306,31 @@ public sealed class MainForm : Form
         if (confirmed != DialogResult.OK)
             return;
 
+        // Snapshot before deleting so undo can re-insert the row.
+        _lastDeleted = (expense.Date, expense.Amount, expense.Category, expense.Note);
+        _undoButton.Enabled = true;
+
         _service.Delete(row.Id);
         LoadCategories();
-        ApplyFilters();
+        _ = ApplyFiltersAsync();
     }
 
-    private void ImportCsv()
+    private void UndoDelete()
+    {
+        if (_lastDeleted is not { } snapshot)
+            return;
+
+        // Re-inserted with a new id; the row id is an implementation detail, not data.
+        _service.Add(snapshot.Date, snapshot.Amount, snapshot.Category, snapshot.Note);
+
+        _lastDeleted = null;
+        _undoButton.Enabled = false;
+
+        LoadCategories();
+        _ = ApplyFiltersAsync();
+    }
+
+    private async Task ImportCsvAsync()
     {
         using var dialog = new OpenFileDialog
         {
@@ -258,10 +342,20 @@ public sealed class MainForm : Form
             return;
 
         ImportResult result;
+
+        UseWaitCursor = true;
         try
         {
-            using var reader = new StreamReader(dialog.FileName);
-            result = _service.ImportCsv(reader);
+            await _databaseGate.WaitAsync();
+            try
+            {
+                using var reader = new StreamReader(dialog.FileName);
+                result = await Task.Run(() => _service.ImportCsv(reader));
+            }
+            finally
+            {
+                _databaseGate.Release();
+            }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -269,9 +363,13 @@ public sealed class MainForm : Form
             MessageBox.Show(this, ex.Message, "Import failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
         }
+        finally
+        {
+            UseWaitCursor = false;
+        }
 
         LoadCategories();
-        ApplyFilters();
+        _ = ApplyFiltersAsync();
 
         var message = $"{result.Imported} row(s) imported from {Path.GetFileName(dialog.FileName)}.";
 
@@ -289,7 +387,7 @@ public sealed class MainForm : Form
             result.Errors.Count == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
     }
 
-    private void ExportCsv()
+    private async Task ExportCsvAsync()
     {
         var (from, to) = SelectedRange();
 
@@ -303,16 +401,29 @@ public sealed class MainForm : Form
         if (dialog.ShowDialog(this) != DialogResult.OK)
             return;
 
+        UseWaitCursor = true;
         try
         {
-            using var writer = new StreamWriter(dialog.FileName);
-            _service.ExportCsv(writer, from, to);
+            await _databaseGate.WaitAsync();
+            try
+            {
+                using var writer = new StreamWriter(dialog.FileName);
+                await Task.Run(() => _service.ExportCsv(writer, from, to));
+            }
+            finally
+            {
+                _databaseGate.Release();
+            }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             ErrorLog.Write(ex, "csv export");
             MessageBox.Show(this, ex.Message, "Export failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
+        }
+        finally
+        {
+            UseWaitCursor = false;
         }
 
         MessageBox.Show(
