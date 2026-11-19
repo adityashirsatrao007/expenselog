@@ -86,6 +86,15 @@ tests/
   ExpenseLog.Data.Tests/      16 xUnit tests against real SQLite files
 ```
 
+## Download and run
+
+Every push to `main` publishes a single self-contained `ExpenseLog.exe` for `win-x64`, with the
+.NET runtime and the SQLite native library bundled — nothing needs to be installed first.
+Download it from the artifacts of the latest green run: **Actions → the newest `build` run →
+Artifacts → `ExpenseLog-win-x64`**.
+
+The executable is unsigned, so SmartScreen warns on first launch: *More info → Run anyway*.
+
 ## Build and run
 
 Requires the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
