@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>ExpenseLog</AssemblyName>
+    <RootNamespace>ExpenseLog.App</RootNamespace>
+    <ApplicationIcon>assets\app.ico</ApplicationIcon>
+    <Version>1.0.0</Version>
+    <Product>ExpenseLog</Product>
+    <Description>Local expense tracker built on WinForms, EF Core and SQLite.</Description>
+  </PropertyGroup>
+
+  <!-- Lets contributors on Linux/macOS restore and compile the solution. No effect on Windows. -->
+  <PropertyGroup Condition="'$(OS)' != 'Windows_NT'">
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ExpenseLog.Data\ExpenseLog.Data.csproj" />
+  </ItemGroup>
+
+</Project>
